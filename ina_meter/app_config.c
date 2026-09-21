@@ -224,26 +224,57 @@ static void app_config_set(AppConfig* config, Slice section, Slice key, Slice va
     }
 }
 
-static void app_config_parse(AppConfig* config, Slice text) {
-    Slice section = slice_empty();
-    while(!slice_is_empty(text)) {
-        Slice line = slice_trim_left(tok_until_eol(&text));
-        if(slice_is_empty(line) || tok_skip_char(&line, '#')) {
-            // Skip line
-        } else if(tok_skip_char(&line, '[')) {
-            // Change section
-            section = slice_trim(tok_until_char(&line, ']'));
-        } else {
-            // Parse key-value pair
-            Slice key = slice_trim(tok_until_char(&line, '='));
-            Slice value = slice_empty();
-            if(tok_skip_char(&line, '=')) {
-                value = slice_trim(line);
-            }
-            app_config_set(config, section, key, value);
+static void app_config_parse_line(AppConfig* config, FuriString* section_name, FuriString* text) {
+    const char* str = furi_string_get_cstr(text);
+    Slice line = slice_trim_left((Slice){str, str + furi_string_size(text)});
+    if(slice_is_empty(line) || tok_skip_char(&line, '#')) {
+        // Skip line
+    } else if(tok_skip_char(&line, '[')) {
+        // Change section; it must remain valid when the line buffer is reused.
+        Slice section = slice_trim(tok_until_char(&line, ']'));
+        furi_string_set_strn(section_name, section.start, slice_len(section));
+    } else {
+        // Parse key-value pair
+        Slice key = slice_trim(tok_until_char(&line, '='));
+        Slice value = slice_empty();
+        if(tok_skip_char(&line, '=')) {
+            value = slice_trim(line);
         }
-        tok_skip_eol(&text);
+        const char* section = furi_string_get_cstr(section_name);
+        app_config_set(
+            config, (Slice){section, section + furi_string_size(section_name)}, key, value);
     }
+}
+
+static bool app_config_parse(AppConfig* config, File* file) {
+    uint8_t buffer[512];
+    FuriString* line = furi_string_alloc();
+    FuriString* section = furi_string_alloc();
+    uint64_t remaining = storage_file_size(file);
+    bool success = true;
+
+    while(remaining > 0) {
+        size_t count = storage_file_read(file, buffer, MIN(sizeof(buffer), remaining));
+        if(count == 0 || storage_file_get_error(file) != FSE_OK) {
+            success = false;
+            break;
+        }
+        remaining -= count;
+        for(size_t i = 0; i < count; i++) {
+            if(buffer[i] == '\n') {
+                app_config_parse_line(config, section, line);
+                // Retain capacity for subsequent records, including records spanning chunks.
+                furi_string_set_str(line, "");
+            } else {
+                furi_string_push_back(line, buffer[i]);
+            }
+        }
+    }
+
+    if(success && !furi_string_empty(line)) app_config_parse_line(config, section, line);
+    furi_string_free(section);
+    furi_string_free(line);
+    return success;
 }
 
 void app_config_save(const AppConfig* config, Storage* storage) {
@@ -282,19 +313,12 @@ void app_config_load(AppConfig* config, Storage* storage) {
     furi_check(file != NULL, "Failed to allocate file");
 
     if(storage_file_open(file, CONFIG_FILE_NAME, FSAM_READ, FSOM_OPEN_EXISTING)) {
-        size_t buff_size = storage_file_size(file);
-        if(buff_size > 0) {
-            char* buff = malloc(buff_size);
-
-            if(storage_file_read(file, buff, buff_size) == buff_size) {
-                Slice text = {buff, buff + buff_size};
-                FURI_LOG_I(TAG, "Parsing configuration...");
-                app_config_parse(config, text);
-            } else {
-                FURI_LOG_E(TAG, "Failed to read config file");
-            }
-
-            free(buff);
+        AppConfig loaded = *config;
+        FURI_LOG_I(TAG, "Parsing configuration...");
+        if(app_config_parse(&loaded, file)) {
+            *config = loaded;
+        } else {
+            FURI_LOG_E(TAG, "Failed to read config file");
         }
     } else {
         FURI_LOG_E(TAG, "Failed to open config file");
